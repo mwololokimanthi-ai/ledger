@@ -1,0 +1,612 @@
+#!/usr/bin/env python3
+"""ledger — every pi session on this machine, live or ended, in one table.
+
+  ledger table            live + sessions touched in the last 72h
+  ledger table --all      every session on disk
+  ledger show <sel>       one session: ids, paths, tmux target, restore command
+  ledger open <sel>       attach to its tmux session, or restore it into a new one
+  ledger history          ended sessions, newest first, grouped by day
+  ledger snapshot         freeze current state to state.json (what restore reads)
+  ledger restore          recreate tmux sessions from the last snapshot
+  ledger serve            localhost dashboard on 127.0.0.1
+  ledger pin <sel>        keep this session in restore even when it ended
+  ledger doctor           self-check: stores, tmux, pi, service, snapshot, bindings
+  ledger tui              full-screen console (j/k, enter, o, /, ?, q)
+
+<sel> is a row number from `table`, a session id or prefix, a tmux target
+(name, name:win, name:win.pane), a project name, or a substring of the intent.
+
+Read-only against pi's stores: ledger never writes a transcript. The only writes are
+state.json, pins.json and tmux sessions you explicitly open or restore.
+"""
+from __future__ import annotations
+
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import ledger_core as L  # noqa: E402
+
+def col(code: str) -> str:
+    return code if sys.stdout.isatty() else ""
+
+
+DIM, BOLD, RED, YEL, GRN, CYA, MAG, RST = (
+    col("\033[2m"), col("\033[1m"), col("\033[31m"), col("\033[33m"),
+    col("\033[32m"), col("\033[36m"), col("\033[35m"), col("\033[0m"),
+)
+STATE_COL = {
+    "error": RED, "awaiting": YEL, "quiet-awaiting": YEL,
+    "working": GRN, "quiet-working": GRN, "queued": CYA,
+    "recent-unowned": CYA, "started": MAG, "ended": DIM, "idle": DIM,
+}
+
+
+def load(all_time: bool = False) -> dict:
+    """Rebuild from disk. all_time=True indexes every transcript, not just the window."""
+    return L.build_state(window_h=None if all_time else L.DEFAULT_WINDOW_H)
+
+
+def need(state: dict, sel: str | None) -> dict:
+    if not sel:
+        sys.exit("usage: ledger show|open|pin <sel>   (a row number from `ledger table`)")
+    r = L.resolve(state, sel)
+    if not r:
+        sys.exit(f"ledger: no session matches {sel!r}. Run `ledger table`.")
+    return r
+
+
+def target_of(r: dict) -> str:
+    if r["tmux"] != "-":
+        return r["tmux"]
+    return ""
+
+
+def slug(name: str) -> str:
+    s = re.sub(r"[^a-z0-9]+", "-", (name or "session").lower()).strip("-")
+    return s[:24] or "session"
+
+
+def cmd_table(args: list[str]) -> int:
+    all_time = "--all" in args
+    wide = "--wide" in args
+    runs = "--subagents" in args
+    hours = L.DEFAULT_WINDOW_H
+    if "--hours" in args:
+        i = args.index("--hours")
+        try:
+            hours = float(args[i + 1])
+        except (IndexError, ValueError):
+            sys.exit("--hours needs a number")
+    st = load(all_time=all_time)
+    rows = st["sessions"] if all_time else [r for r in st["sessions"] if L.in_window(r, hours)]
+    hidden = sum(1 for r in rows if r["kind"] == "subagent")
+    if not runs:
+        rows = [r for r in rows if r["kind"] != "subagent"]
+    rows = sorted(rows, key=L.sort_key)
+
+    if "--json" in args:
+        print(json.dumps(rows, indent=1))
+        return 0
+
+    counts = st["counts"]
+    live = sum(1 for r in rows if r["live"])
+    b = st.get("bindings", {})
+    print(f"{BOLD}{len(rows)} sessions{RST} {DIM}· {live} live · "
+          f"{len(rows) - live} ended · "
+          f"bindings {b.get('exact', 0)} exact / {st.get('inferred_bindings', 0)} inferred / "
+          f"{st.get('unbound_processes', 0)} unbound"
+          + (f" · {hidden} subagent runs hidden (--subagents){RST}" if hidden and not runs else RST))
+    if not all_time:
+        print(f"{DIM}window {hours:.0f}h · `ledger table --all` for everything{RST}")
+    print()
+    head = f"{'#':>3} {'STATE':15s} {'AGE':>5s}  {'TARGET':20s} {'PROJECT':16s} INTENT"
+    print(f"{DIM}{head}{RST}")
+    for i, r in enumerate(rows, 1):
+        sc = STATE_COL.get(r["state"], "")
+        age = L.human_age(r["idle_s"])
+        tgt = r["tmux"] if r["tmux"] != "-" else (
+            f"{r['tmux_session']}" if r["tmux_session"] else "-")
+        flag = "~" if r["live"] and r["binding"] not in ("exact", "created-after",
+                                                         "succession", "launched") else " "
+        proj = (r["project"] or "?")[:16]
+        line = (f"{i:3d} {sc}{r['state']:15s}{RST} {age:>5s} "
+                f"{flag}{tgt:<19s} {proj:16s} {r['intent']}")
+        if wide:
+            line += f"  {r['id'][:8]} pid={r['pid'] or '-'} {r['home_rel']}"
+        print(line)
+    return 0
+
+
+def cmd_show(args: list[str]) -> int:
+    st = load()
+    r = need(st, args[0] if args else None)
+    sc = STATE_COL.get(r["state"], "")
+    print(f"{BOLD}{r['state'].upper()}{RST} {DIM}{r['id'] or '(no transcript)'}{RST}")
+    print(f"  project    {r['project']}  {DIM}({r['home_rel']}){RST}")
+    print(f"  intent     {r['intent']}")
+    print(f"  state      {sc}{r['state']}{RST} · last activity {L.human_age(r['idle_s'])} ago "
+          f"({r['last_activity']})")
+    print(f"  started    {r['started']}")
+    if r["live"]:
+        print(f"  owner      pid {r['pid']} · binding {r['binding']}"
+              + ("  (inferred)" if r["binding"] in ("created-after", "succession") else ""))
+    print(f"  tmux       {r['tmux'] if r['tmux'] != '-' else '(not in tmux)'}"
+          + (f"  {r['pane_size']}" if r.get("pane_size") else ""))
+    if r.get("tmux_windows"):
+        print(f"  session    {r['tmux_session']} · {r['tmux_windows']} windows"
+              + (" · attached" if r.get("tmux_attached") else ""))
+    print(f"  store      {r['store']} · {r['size'] // 1024} KiB"
+          + (f" · {r['copies']} copies on disk" if r.get("copies", 1) > 1 else ""))
+    if r["path"]:
+        print(f"  file       {r['path']}")
+    if r["restore"]:
+        print(f"  restore    {r['restore']}")
+    print(f"  pinned     {'yes' if r['pinned'] else 'no'}")
+    print()
+    print(f"{DIM}open it: ledger open {args[0] if args else '<sel>'}{RST}")
+    return 0
+
+
+def inside_tmux() -> bool:
+    return bool(os.environ.get("TMUX"))
+
+
+def run(cmd: str, dry: bool) -> int:
+    print(f"  $ {cmd}")
+    if dry:
+        return 0
+    return subprocess.call(cmd, shell=True)
+
+
+def cmd_open(args: list[str]) -> int:
+    dry = "--dry-run" in args
+    attach = "--no-attach" not in args
+    sel = next((a for a in args if not a.startswith("-")), None)
+    st = load()
+    r = need(st, sel)
+
+    if r["tmux"] != "-":
+        sess, _, win = r["tmux_session"], None, r.get("tmux", "")
+        cmds = []
+        if inside_tmux():
+            cmds.append(f"tmux switch-client -t {sess}")
+        else:
+            cmds.append(f"tmux attach -t {sess}")
+        print(f"{BOLD}{r['project']}{RST} is already running in {r['tmux']}.")
+        if attach:
+            print(f"{DIM}" + "\n".join(cmds) + RST)
+            for cmd in cmds:
+                run(cmd, dry)
+        else:
+            print(f"{DIM}--no-attach: left the existing pane alone{RST}")
+        return 0
+
+    if not r["id"]:
+        print(f"{RED}pid {r['pid']} has no transcript and no tmux pane — nothing to open.{RST}")
+        print(f"{DIM}It was launched outside tmux and never prompted. Kill it or use its terminal.{RST}")
+        return 1
+
+    if r.get("path") and not os.path.exists(r["path"]):
+        print(f"{RED}transcript is gone{RST}: {r['path']}")
+        print(f"{DIM}pi would open a new empty session instead — refusing.{RST}")
+        return 1
+    name = slug(r["project"])
+    existing = set(L.tmux_sessions())
+    if name in existing:
+        name = f"{name}-{r['short']}"
+    new = (f"tmux new-session -d -s {name} -c {shquote(r['cwd'])} "
+           f"'{r['restore']}'")
+    print(f"{BOLD}Restoring{RST} {r['id'][:8]} ({r['project']}) into tmux session {BOLD}{name}{RST}")
+    print(f"  intent  {r['intent']}")
+    rc = run(new, dry)
+    if rc:
+        print(f"{RED}tmux refused the session{RST}")
+        return rc
+    if not dry:
+        L.record_launch(name, r)
+    if not attach:
+        verb = "would create" if dry else "created"
+        print(f"{DIM}--dry-run: {verb} tmux session {name}" if dry
+              else f"{DIM}{verb} tmux session {name} · attach with: tmux attach -t {name}{RST}")
+        return 0
+    for cmd in ([f"tmux switch-client -t {name}"] if inside_tmux() else [f"tmux attach -t {name}"]):
+        run(cmd, dry)
+    if dry:
+        print(f"{DIM}--dry-run: nothing was created{RST}")
+    return 0
+
+
+def shquote(s: str) -> str:
+    return "'" + s.replace("'", "'\\''") + "'"
+
+
+def cmd_history(args: list[str]) -> int:
+    days = 7
+    if "--days" in args:
+        i = args.index("--days")
+        try:
+            days = int(args[i + 1])
+        except (IndexError, ValueError):
+            sys.exit("--days needs a number")
+    everything = "--all" in args
+    limit = 200
+    st = load(all_time=everything)
+    rows = st["sessions"] if everything else [r for r in st["sessions"]
+                                              if L.in_window(r, days * 24)]
+    rows = [r for r in rows if not r["live"]]
+    if "--subagents" not in args:
+        rows = [r for r in rows if r["kind"] != "subagent"]
+    rows.sort(key=lambda r: -r["mtime_epoch"])
+    day = ""
+    n = 0
+    for r in rows:
+        d = r["last_activity"][:10]
+        if d != day:
+            day = d
+            print(f"\n{BOLD}{d}{RST}")
+        n += 1
+        print(f"  {r['id'][:8]}  {L.human_age(r['idle_s']):>5s}  "
+              f"{(r['project'] or '?')[:16]:16s} {r['intent'][:70]}")
+        if n >= limit:
+            print(f"{DIM}… {len(rows) - n} more (--all to ignore the window){RST}")
+            break
+    if not rows:
+        print("no ended sessions in range")
+    return 0
+
+
+def cmd_snapshot(args: list[str]) -> int:
+    st = L.build_state(window_h=None)
+    path = L.write_state(st)
+    print(f"{path} · {len(st['sessions'])} sessions · {st['live']} live")
+    return 0
+
+
+def cmd_pin(args: list[str]) -> int:
+    st = load()
+    if not args:
+        pins = sorted(L.load_pins())
+        print(f"{len(pins)} pinned")
+        for p in pins:
+            print(f"  {p}")
+        return 0
+    r = need(st, args[0])
+    if not r["id"]:
+        sys.exit("ledger: a process with no transcript cannot be pinned")
+    pins = L.load_pins()
+    if args[0] == "off" or "--remove" in args:
+        pins.discard(r["id"])
+    else:
+        pins.add(r["id"])
+    L.save_pins(pins)
+    print(f"{r['id'][:8]} {'unpinned' if '--remove' in args else 'pinned'}")
+    return 0
+
+
+def verify_session(name: str, expected: int, timeout: float = 8.0) -> tuple[bool, str]:
+    """A created pane can die immediately (wrong session path, missing model, ...).
+    tmux closes the session with its last pane, so an empty listing is a failure."""
+    last = ""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        out = L.ab.sh(["tmux", "list-panes", "-s", "-t", name,
+                       "-F", "#{pane_dead} #{pane_current_command}"])
+        panes = [ln for ln in out.splitlines() if ln.strip()]
+        if panes:
+            last = ", ".join(p.split(" ", 1)[1] if " " in p else p for p in panes)
+            if len(panes) >= expected and all(p.startswith("0") for p in panes):
+                # the command may still be a shell mid-start, and a late crash closes
+                # the pane; confirm once more after it has had time to fail
+                time.sleep(2.0)
+                again = L.ab.sh(["tmux", "list-panes", "-s", "-t", name,
+                                 "-F", "#{pane_dead} #{pane_current_command}"])
+                panes2 = [ln for ln in again.splitlines() if ln.strip()]
+                if len(panes2) >= expected and all(p.startswith("0") for p in panes2):
+                    return True, ", ".join(p.split(" ", 1)[1] if " " in p else p for p in panes2)
+                return False, ", ".join(p.split(" ", 1)[1] if " " in p else p for p in panes2) or "session vanished"
+        time.sleep(0.5)
+    return False, last
+
+
+def cmd_restore(args: list[str]) -> int:
+    dry = "--dry-run" in args or "--yes" not in args
+    max_sessions, max_panes = 8, 4
+    if "--max" in args:
+        try:
+            max_sessions = max(1, int(args[args.index("--max") + 1]))
+        except (IndexError, ValueError):
+            sys.exit("--max needs a number")
+    only_pinned = "--pinned" in args
+    st = L.load_state()
+    if not st.get("sessions"):
+        sys.exit("no snapshot — run `ledger snapshot` before rebooting")
+    live_tmux = set(L.tmux_sessions())
+    pins = L.load_pins()
+    rows = [r for r in st["sessions"]
+            if r["id"] and r.get("tmux_session") and r["tmux_session"] not in live_tmux
+            and (r["pinned"] or r["id"] in pins
+                 or (not only_pinned and (r["live"] or r.get("binding") == "launched")))]
+    if not rows:
+        print("nothing to restore")
+        return 0
+
+    missing = [r for r in rows if r.get("path") and not os.path.exists(r["path"])]
+    rows = [r for r in rows if r not in missing]
+
+    groups: dict[str, list[dict]] = {}
+    for r in sorted(rows, key=lambda r: (r["tmux_session"], r.get("tmux_win", 0),
+                                         r.get("tmux_pane", 0))):
+        groups.setdefault(r["tmux_session"], []).append(r)
+    def rank(name: str):
+        rs = groups[name]
+        pinned = any(r["pinned"] or r["id"] in pins for r in rs)
+        recent = max(r["mtime_epoch"] for r in rs)
+        return (0 if pinned else 1, -recent, name)
+
+    names = sorted(groups, key=rank)[:max_sessions]
+    extra = sum(max(0, len(groups[n]) - max_panes) for n in names)
+    recorded = {r["tmux"] for r in rows}
+    known_sessions = {r["tmux_session"] for r in rows}
+    orphan_sessions = sorted({p["session"] for p in st.get("panes", [])
+                              if p["session"] not in live_tmux
+                              and p["session"] not in known_sessions
+                              and p["session"] not in names})
+    unrecorded = [p for p in st.get("panes", [])
+                  if p["session"] in names and p["target"] not in recorded]
+
+    if missing:
+        print(f"{RED}{len(missing)} session(s) skipped — transcript missing on disk:{RST}")
+        for r in missing[:5]:
+            print(f"  {r['id'][:8]} {r['path']}")
+    print(f"{BOLD}restore plan{RST} {DIM}({len(names)} sessions, cap {max_sessions}; "
+          f"≤{max_panes} panes each){RST}")
+    for name in names:
+        rs = groups[name]
+        print(f"  {name:20s} {rs[0]['project']:14s} {len(rs)} pane(s)"
+              + (f" {DIM}{rs[0]['intent'][:40]}{RST}" if rs[0]["intent"] else ""))
+        for r in rs[:max_panes]:
+            print(f"      {r['tmux']:22s} {r['id'][:8]}  {' '.join(r['restore'].split()[:2])} …")
+        if len(rs) > max_panes:
+            print(f"      {RED}{len(rs) - max_panes} pane(s) over the cap — not restored{RST}")
+    if len(groups) > max_sessions:
+        print(f"{DIM}  … {len(groups) - max_sessions} more sessions; cap {max_sessions}{RST}")
+    if unrecorded:
+        print(f"{DIM}  panes not recreated (no session record): "
+              + ", ".join(f"{p['target']} ({p['cmd']})" for p in unrecorded) + RST)
+    if orphan_sessions:
+        print(f"{DIM}  sessions skipped (no session record at all): "
+              + ", ".join(orphan_sessions[:6]) + RST)
+    if extra:
+        print(f"{YEL}  {extra} pane(s) would exceed {max_panes} per session{RST}")
+    print()
+
+    failed = [("missing", str(len(missing)))] if missing else []
+    for name in names:
+        rs = groups[name][:max_panes]
+        base = rs[0]
+        cmds = [f"tmux new-session -d -s {name} -c {shquote(base['cwd'])} '{base['restore']}'"]
+        for r in rs[1:]:
+            if r.get("tmux_win", 0) != base.get("tmux_win", 0):
+                cmds.append(f"tmux new-window -d -t {name}:{r['tmux_win']} "
+                            f"-c {shquote(r['cwd'])} '{r['restore']}'")
+            else:
+                cmds.append(f"tmux split-window -h -t {name}:{base['tmux_win']} "
+                            f"-c {shquote(r['cwd'])} '{r['restore']}'")
+        ok = True
+        for cmd in cmds:
+            if run(cmd, dry) != 0:
+                ok = False
+                break
+        if dry:
+            continue
+        if ok:
+            good, detail = verify_session(name, len(rs))
+            if good:
+                L.record_launch(name, base)
+                print(f"  {GRN}ok{RST}   {name}: {detail}")
+            else:
+                failed.append((name, detail))
+                print(f"  {RED}dead{RST} {name}: {detail or 'session vanished'}")
+        else:
+            failed.append((name, "tmux refused"))
+            print(f"  {RED}fail{RST} {name}: tmux refused a command")
+
+    if dry:
+        print(f"{DIM}dry run — pass --yes to create these sessions{RST}")
+        return 0
+    print()
+    if not names:
+        print(f"{RED}nothing created{RST}: {len(missing)} session(s) had no transcript")
+        return 1
+    dead = [f for f in failed if f[0] != "missing"]
+    line = f"{len(names) - len(dead)}/{len(names)} sessions live"
+    if dead:
+        line += f" · {len(dead)} dead"
+    if missing:
+        line += f" · {len(missing)} skipped (transcript missing)"
+    print(line)
+    return 1 if failed else 0
+
+
+def cmd_serve(args: list[str]) -> int:
+    import http.server
+    import socketserver
+    import threading
+
+    port = 8900
+    if "--port" in args:
+        i = args.index("--port")
+        try:
+            port = int(args[i + 1])
+        except (IndexError, ValueError):
+            sys.exit("--port needs a number")
+    root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
+    cache = {"at": 0.0, "body": b""}
+
+    class Handler(http.server.SimpleHTTPRequestHandler):
+        def __init__(self, *a, **kw):
+            super().__init__(*a, directory=root, **kw)
+
+        def do_GET(self):  # noqa: N802
+            path = self.path.split("?")[0]
+            if path == "/" and not os.path.exists(os.path.join(root, "index.html")):
+                body = (b"<!doctype html><meta charset=utf-8><title>ledger</title>"
+                        b"<body style=\"font:14px ui-monospace,monospace;padding:2rem;"
+                        b"background:#0f1115;color:#c9d1d9\">"
+                        b"<h1 style=\"font-size:1rem\">ledger</h1>"
+                        b"<p>dashboard not built yet. state is at "
+                        b"<a style=\"color:#58a6ff\" href=/api/state>/api/state</a></p>")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            if path in ("/api/state", "/state.json"):
+                if time.time() - cache["at"] > 4:
+                    cache["body"] = json.dumps(L.build_state()).encode()
+                    cache["at"] = time.time()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Content-Length", str(len(cache["body"])))
+                self.end_headers()
+                self.wfile.write(cache["body"])
+                return
+            super().do_GET()
+
+        def log_message(self, *a):
+            pass
+
+    class Server(socketserver.ThreadingTCPServer):
+        allow_reuse_address = True
+        daemon_threads = True
+
+    httpd, err = None, None
+    for candidate in range(port, port + 20):
+        try:
+            httpd = Server(("127.0.0.1", candidate), Handler)
+            port = candidate
+            break
+        except OSError as exc:
+            err = exc
+    if httpd is None:
+        sys.exit(f"ledger: no free port in {port}..{port + 19} ({err.strerror}); try --port <n>")
+    with httpd:
+        print(f"ledger on http://127.0.0.1:{port}/  {DIM}(127.0.0.1 only, Ctrl-C to stop){RST}")
+        try:
+            httpd.serve_forever()
+        except KeyboardInterrupt:
+            print()
+    return 0
+
+
+def cmd_tui(args: list[str]) -> int:
+    import tui
+    return tui.main(args)
+
+
+def cmd_doctor(args: list[str]) -> int:
+    """Cheap self-checks: stores, tmux, pi, service, snapshot, binding health."""
+    import socket as _socket
+
+    checks: list[tuple[str, str, str]] = []   # (status, name, detail)
+
+    def add(status: str, name: str, detail: str) -> None:
+        checks.append((status, name, detail))
+
+    for root in L.SESSION_ROOTS:
+        n = sum(1 for _ in __import__("glob").glob(
+            os.path.join(root, "**", "*.jsonl"), recursive=True)) if os.path.isdir(root) else 0
+        add("ok" if n else "warn", f"store {root.replace(os.path.expanduser('~'), '~')}",
+            f"{n} transcripts" if n else "missing or empty")
+
+    add("ok" if os.path.exists(L.AGENTBOARD) else "fail", "agentboard.py",
+        L.AGENTBOARD.replace(os.path.expanduser("~"), "~"))
+
+    ver = L.ab.sh(["tmux", "-V"]).strip()
+    sessions = L.tmux_sessions()
+    add("ok" if sessions else "fail", "tmux", f"{ver or 'not found'} · {len(sessions)} sessions")
+
+    piver = L.ab.sh(["pi", "--version"]).strip().splitlines()
+    help_txt = L.ab.sh(["pi", "--help"])
+    add("ok" if "--session <path|id>" in help_txt else "warn", "pi",
+        (piver[0] if piver else "not on PATH")
+        + (" · --session supported" if "--session <path|id>" in help_txt else " · --session missing"))
+
+    st = L.load_state()
+    if st.get("sessions"):
+        age = int(time.time()) - st.get("generated_epoch", 0)
+        add("ok" if age < 3600 else "warn", "snapshot",
+            f"{len(st['sessions'])} sessions · {L.human_age(age)} old · "
+            f"{len(st.get('panes', []))} panes")
+    else:
+        add("warn", "snapshot", "no state.json — run `ledger snapshot`")
+
+    active = L.ab.sh(["systemctl", "--user", "is-active", "ledger-serve.service"]).strip()
+    add("ok" if active == "active" else "warn", "ledger-serve", active or "not installed")
+
+    port, listening = 8900, False
+    for cand in range(8900, 8920):
+        s_ = _socket.socket()
+        s_.settimeout(0.2)
+        if s_.connect_ex(("127.0.0.1", cand)) == 0:
+            listening, port = True, cand
+            break
+        s_.close()
+    add("ok" if listening else "warn", "api", f"127.0.0.1:{port}" if listening else "not listening")
+
+    launches = L.load_launches()
+    add("ok" if launches else "dim", "launched.json", f"{len(launches)} pane(s) recorded")
+
+    live = [r for r in st.get("sessions", []) if r.get("live")]
+    guessed = [r for r in live if r.get("binding") in ("created-after", "succession")]
+    unbound = [r for r in live if r.get("binding") == "none"]
+    add("ok" if not guessed else "warn", "binding",
+        f"{len(live)} live · {len(guessed)} inferred · {len(unbound)} unbound")
+
+    dupes = sum(1 for r in st.get("sessions", []) if r.get("copies", 1) > 1)
+    add("ok" if not dupes else "warn", "duplicates", f"{dupes} session id(s) in more than one file")
+
+    bad = [r for r in st.get("sessions", []) if r.get("id") and not os.path.exists(r.get("path", ""))]
+    add("ok" if not bad else "fail", "transcripts", f"{len(bad)} snapshot record(s) point at missing files")
+
+    width = max(len(n) for _, n, _ in checks)
+    for status, name, detail in checks:
+        colr = {"ok": GRN, "warn": YEL, "fail": RED, "dim": DIM}[status]
+        print(f"  {colr}{status:4s}{RST} {name:{width}s}  {DIM}{detail}{RST}")
+    fails = sum(1 for s_, _, _ in checks if s_ == "fail")
+    warns = sum(1 for s_, _, _ in checks if s_ == "warn")
+    print(f"\n{len(checks) - fails - warns}/{len(checks)} ok"
+          + (f" · {warns} warn" if warns else "")
+          + (f" · {fails} fail" if fails else ""))
+    return 1 if fails else 0
+
+
+COMMANDS = {
+    "table": cmd_table, "ls": cmd_table, "show": cmd_show, "open": cmd_open,
+    "history": cmd_history, "snapshot": cmd_snapshot, "restore": cmd_restore,
+    "serve": cmd_serve, "pin": cmd_pin, "doctor": cmd_doctor, "tui": cmd_tui,
+}
+
+
+def main(argv: list[str]) -> int:
+    if hasattr(signal, "SIGPIPE"):
+        signal.signal(signal.SIGPIPE, signal.SIG_DFL)   # `ledger table | head` exits quietly
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(__doc__)
+        return 0
+    fn = COMMANDS.get(argv[0])
+    if not fn:
+        sys.exit(f"ledger: unknown command {argv[0]!r}\n\n{__doc__}")
+    return fn(argv[1:])
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
